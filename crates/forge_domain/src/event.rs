@@ -8,12 +8,24 @@ use serde_json::Value;
 use crate::{NamedTool, ToolCallFull, ToolDefinition, ToolName};
 
 // We'll use simple strings for JSON schema compatibility
-#[derive(Debug, JsonSchema, Deserialize, Serialize, Clone, Setters)]
+#[derive(Debug, Deserialize, Serialize, Clone, Setters)]
 pub struct Event {
     pub id: String,
     pub name: String,
-    pub value: String,
+    pub value: Value,
     pub timestamp: String,
+}
+
+#[derive(Debug, JsonSchema, Deserialize, Serialize, Clone)]
+pub struct EventMessage {
+    pub name: String,
+    pub value: Value,
+}
+
+impl From<EventMessage> for Event {
+    fn from(value: EventMessage) -> Self {
+        Self::new(value.name, value.value)
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, Setters)]
@@ -44,7 +56,7 @@ impl Event {
         ToolDefinition {
             name: Self::tool_name(),
             description: "Dispatches an event with the provided name and value".to_string(),
-            input_schema: schema_for!(Self),
+            input_schema: schema_for!(EventMessage),
             output_schema: None,
         }
     }
@@ -53,18 +65,16 @@ impl Event {
         if tool_call.name != Self::tool_definition().name {
             return None;
         }
-        serde_json::from_value(tool_call.arguments.clone()).ok()
+        let message: Option<EventMessage> =
+            serde_json::from_value(tool_call.arguments.clone()).ok();
+
+        message.map(|message| message.into())
     }
 
-    pub fn new(name: impl ToString, value: impl ToString) -> Self {
+    pub fn new<V: Into<Value>>(name: impl ToString, value: V) -> Self {
         let id = uuid::Uuid::new_v4().to_string();
         let timestamp = chrono::Utc::now().to_rfc3339();
 
-        Self {
-            id,
-            name: name.to_string(),
-            value: value.to_string(),
-            timestamp,
-        }
+        Self { id, name: name.to_string(), value: value.into(), timestamp }
     }
 }

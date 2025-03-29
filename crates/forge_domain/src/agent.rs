@@ -1,11 +1,11 @@
 use derive_more::derive::Display;
 use derive_setters::Setters;
 use merge::Merge;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::merge::Key;
 use crate::template::Template;
-use crate::{EventContext, ModelId, SystemContext, ToolName};
+use crate::{Error, EventContext, ModelId, Result, SystemContext, ToolDefinition, ToolName};
 
 // Unique identifier for an agent
 #[derive(Debug, Display, Eq, PartialEq, Hash, Clone, Serialize, Deserialize)]
@@ -33,6 +33,20 @@ impl From<ToolName> for AgentId {
 #[derive(Debug, Clone, Serialize, Deserialize, Merge, Setters)]
 #[setters(strip_option, into)]
 pub struct Agent {
+    /// Controls whether this agent's output should be hidden from the console
+    /// When false (default), output is not displayed
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[merge(strategy = crate::merge::option)]
+    pub hide_content: Option<bool>,
+
+    /// Flag to disable this agent, when true agent will not be activated
+    /// Default is false (agent is enabled)
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[merge(strategy = crate::merge::option)]
+    pub disable: Option<bool>,
+
     /// Flag to enable/disable tool support for this agent.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -87,7 +101,7 @@ pub struct Agent {
 
     /// Used to specify the events the agent is interested in    
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[merge(strategy = crate::merge::option)]
+    #[merge(strategy = merge_subscription)]
     pub subscribe: Option<Vec<String>>,
 
     /// Maximum number of turns the agent can take    
@@ -104,13 +118,63 @@ pub struct Agent {
     /// A set of custom rules that the agent should follow
     #[serde(skip_serializing_if = "Option::is_none")]
     #[merge(strategy = crate::merge::option)]
-    pub project_rules: Option<String>,
+    pub custom_rules: Option<String>,
+
+    /// Temperature used for agent
+    ///
+    /// Temperature controls the randomness in the model's output.
+    /// - Lower values (e.g., 0.1) make responses more focused, deterministic,
+    ///   and coherent
+    /// - Higher values (e.g., 0.8) make responses more creative, diverse, and
+    ///   exploratory
+    /// - Valid range is 0.0 to 2.0
+    /// - If not specified, the model provider's default temperature will be
+    ///   used
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "validate_temperature_range")]
+    #[merge(strategy = crate::merge::option)]
+    pub temperature: Option<f32>,
+}
+
+// validate temperature range during deserialization
+fn validate_temperature_range<'de, D>(deserializer: D) -> std::result::Result<Option<f32>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    // Deserialize as Option<f32>
+    let opt = Option::<f32>::deserialize(deserializer)?;
+
+    // If Some value, validate the range
+    if let Some(temp) = opt {
+        if !(0.0..=2.0).contains(&temp) {
+            return Err(Error::custom(format!(
+                "temperature must be between 0.0 and 2.0, got {}",
+                temp
+            )));
+        }
+    }
+
+    Ok(opt)
+}
+
+fn merge_subscription(base: &mut Option<Vec<String>>, other: Option<Vec<String>>) {
+    if let Some(other) = other {
+        if let Some(base) = base {
+            base.extend(other);
+        } else {
+            *base = Some(other);
+        }
+    }
 }
 
 impl Agent {
     pub fn new(id: impl ToString) -> Self {
         Self {
             id: AgentId::new(id),
+            disable: None,
             tool_supported: None,
             model: None,
             description: None,
@@ -123,8 +187,18 @@ impl Agent {
             subscribe: None,
             max_turns: None,
             max_walker_depth: None,
-            project_rules: None,
+            custom_rules: None,
+            hide_content: None,
+            temperature: None,
         }
+    }
+
+    pub fn tool_definition(&self) -> Result<ToolDefinition> {
+        if self.description.is_none() || self.description.as_ref().is_none_or(|d| d.is_empty()) {
+            return Err(Error::MissingAgentDescription(self.id.clone()));
+        }
+        Ok(ToolDefinition::new(self.id.as_str().to_string())
+            .description(self.description.clone().unwrap()))
     }
 }
 
@@ -176,7 +250,32 @@ pub enum Transform {
 }
 
 #[cfg(test)]
+mod hide_content_tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_merge_hide_content() {
+        // Base has no value, other has value
+        let mut base = Agent::new("Base"); // No hide_content set
+        let other = Agent::new("Other").hide_content(true);
+        base.merge(other);
+        assert_eq!(base.hide_content, Some(true));
+
+        // Base has a value, other has another value
+        let mut base = Agent::new("Base").hide_content(false);
+        let other = Agent::new("Other").hide_content(true);
+        base.merge(other);
+        assert_eq!(base.hide_content, Some(true));
+    }
+}
+
+#[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -207,6 +306,21 @@ mod tests {
         let other = Agent::new("Other").tool_supported(true);
         base.merge(other);
         assert_eq!(base.tool_supported, Some(true));
+    }
+
+    #[test]
+    fn test_merge_disable() {
+        // Base has no value, should use other's value
+        let mut base = Agent::new("Base"); // No disable set
+        let other = Agent::new("Other").disable(true);
+        base.merge(other);
+        assert_eq!(base.disable, Some(true));
+
+        // Base has a value, should be overwritten
+        let mut base = Agent::new("Base").disable(false);
+        let other = Agent::new("Other").disable(true);
+        base.merge(other);
+        assert_eq!(base.disable, Some(true));
     }
 
     #[test]
@@ -325,8 +439,60 @@ mod tests {
 
         // Should have other's events
         let subscribe = base.subscribe.as_ref().unwrap();
-        assert_eq!(subscribe.len(), 2);
+        assert_eq!(subscribe.len(), 4);
+        assert!(subscribe.contains(&"event1".to_string()));
+        assert!(subscribe.contains(&"event2".to_string()));
         assert!(subscribe.contains(&"event3".to_string()));
         assert!(subscribe.contains(&"event4".to_string()));
+    }
+
+    #[test]
+    fn test_temperature_validation() {
+        // Valid temperature values should deserialize correctly
+        let valid_temps = [0.0, 0.5, 1.0, 1.5, 2.0];
+        for temp in valid_temps {
+            let json = json!({
+                "id": "test-agent",
+                "temperature": temp
+            });
+
+            let agent: std::result::Result<Agent, serde_json::Error> = serde_json::from_value(json);
+            assert!(
+                agent.is_ok(),
+                "Valid temperature {} should deserialize",
+                temp
+            );
+            assert_eq!(agent.unwrap().temperature, Some(temp));
+        }
+
+        // Invalid temperature values should fail deserialization
+        let invalid_temps = [-0.1, 2.1, 3.0, -1.0, 10.0];
+        for temp in invalid_temps {
+            let json = json!({
+                "id": "test-agent",
+                "temperature": temp
+            });
+
+            let agent: std::result::Result<Agent, serde_json::Error> = serde_json::from_value(json);
+            assert!(
+                agent.is_err(),
+                "Invalid temperature {} should fail deserialization",
+                temp
+            );
+            let err = agent.unwrap_err().to_string();
+            assert!(
+                err.contains("temperature must be between 0.0 and 2.0"),
+                "Error should mention valid range: {}",
+                err
+            );
+        }
+
+        // No temperature should deserialize to None
+        let json = json!({
+            "id": "test-agent"
+        });
+
+        let agent: Agent = serde_json::from_value(json).unwrap();
+        assert_eq!(agent.temperature, None);
     }
 }
